@@ -1,0 +1,45 @@
+{
+  "id": "session-bridge",
+  "name": "Session Bridge",
+  "description": "Cross-channel session context bridging via /session command. List, name, and load session context across channels using Gemini for summarization.",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "enabled": {
+        "type": "boolean"
+      },
+      "geminiModel": {
+        "type": "string",
+        "description": "Gemini model to use for summarization and naming"
+      },
+      "geminiApiKey": {
+        "type": "string",
+        "description": "Gemini API key (or reads from GEMINI_API_KEY env / macOS keychain)"
+      },
+      "maxTranscriptChars": {
+        "type": "integer",
+        "minimum": 1000,
+        "maximum": 500000,
+        "description": "Maximum transcript characters to send to Gemini for summarization"
+      }
+    }
+  },
+  "uiHints": {
+    "enabled": {
+      "label": "Enable Session Bridge"
+    },
+    "geminiModel": {
+      "label": "Gemini Model",
+      "placeholder": "gemini-2.5-pro-preview-06-05"
+    },
+    "geminiApiKey": {
+      "label": "Gemini API Key",
+      "sensitive": true
+    },
+    "maxTranscriptChars": {
+      "label": "Max Transcript Size",
+      "help": "Maximum characters of transcript to send to Gemini"
+    }
+  }
+}

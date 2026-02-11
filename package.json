@@ -1,0 +1,9 @@
+{
+  "name": "session-bridge",
+  "version": "0.1.0",
+  "description": "Cross-channel session context bridging for OpenClaw",
+  "type": "module",
+  "openclaw": {
+    "extensions": ["./index.ts"]
+  }
+}
