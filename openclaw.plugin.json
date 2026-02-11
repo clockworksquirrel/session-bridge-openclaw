@@ -1,7 +1,7 @@
 {
   "id": "session-bridge",
   "name": "Session Bridge",
-  "description": "Cross-channel session context bridging via /session command. List, name, and load session context across channels using Gemini for summarization.",
+  "description": "Cross-channel session context bridging via /session command. List, name, and load session context across channels using Gemini, OpenAI, or OpenRouter for summarization.",
   "configSchema": {
     "type": "object",
     "additionalProperties": false,
@@ -9,19 +9,44 @@
       "enabled": {
         "type": "boolean"
       },
+      "provider": {
+        "type": "string",
+        "enum": ["gemini", "openai", "openrouter"],
+        "description": "LLM provider for naming and summarization (default: gemini)"
+      },
       "geminiModel": {
         "type": "string",
-        "description": "Gemini model to use for summarization and naming"
+        "description": "Gemini model to use (default: gemini-3-pro-preview)"
       },
       "geminiApiKey": {
         "type": "string",
-        "description": "Gemini API key (or reads from GEMINI_API_KEY env / macOS keychain)"
+        "description": "Gemini API key (or GEMINI_API_KEY env / macOS Keychain service 'gemini', account 'api-key')"
+      },
+      "openaiModel": {
+        "type": "string",
+        "description": "OpenAI model to use (default: gpt-4o)"
+      },
+      "openaiApiKey": {
+        "type": "string",
+        "description": "OpenAI API key (or OPENAI_API_KEY env / macOS Keychain service 'openai', account 'api-key')"
+      },
+      "openaiBaseUrl": {
+        "type": "string",
+        "description": "Custom OpenAI-compatible base URL (default: https://api.openai.com/v1)"
+      },
+      "openrouterModel": {
+        "type": "string",
+        "description": "OpenRouter model to use (default: anthropic/claude-sonnet-4)"
+      },
+      "openrouterApiKey": {
+        "type": "string",
+        "description": "OpenRouter API key (or OPENROUTER_API_KEY env / macOS Keychain service 'openrouter', account 'api-key')"
       },
       "maxTranscriptChars": {
         "type": "integer",
         "minimum": 1000,
         "maximum": 500000,
-        "description": "Maximum transcript characters to send to Gemini for summarization"
+        "description": "Maximum transcript characters to send to LLM for summarization"
       }
     }
   },
@@ -29,17 +54,42 @@
     "enabled": {
       "label": "Enable Session Bridge"
     },
+    "provider": {
+      "label": "LLM Provider",
+      "help": "Which LLM provider to use for session naming and summarization"
+    },
     "geminiModel": {
       "label": "Gemini Model",
-      "placeholder": "gemini-2.5-pro-preview-06-05"
+      "placeholder": "gemini-3-pro-preview"
     },
     "geminiApiKey": {
       "label": "Gemini API Key",
       "sensitive": true
     },
+    "openaiModel": {
+      "label": "OpenAI Model",
+      "placeholder": "gpt-4o"
+    },
+    "openaiApiKey": {
+      "label": "OpenAI API Key",
+      "sensitive": true
+    },
+    "openaiBaseUrl": {
+      "label": "OpenAI Base URL",
+      "placeholder": "https://api.openai.com/v1",
+      "help": "Custom base URL for OpenAI-compatible APIs (e.g. local LLMs, Azure)"
+    },
+    "openrouterModel": {
+      "label": "OpenRouter Model",
+      "placeholder": "anthropic/claude-sonnet-4"
+    },
+    "openrouterApiKey": {
+      "label": "OpenRouter API Key",
+      "sensitive": true
+    },
     "maxTranscriptChars": {
       "label": "Max Transcript Size",
-      "help": "Maximum characters of transcript to send to Gemini"
+      "help": "Maximum characters of transcript to send to LLM"
     }
   }
 }

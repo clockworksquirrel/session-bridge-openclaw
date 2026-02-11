@@ -1,6 +1,6 @@
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import { readFileSync, writeFileSync, existsSync } from "fs";
-import { join, dirname } from "path";
+import { join } from "path";
 import { execSync } from "child_process";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -39,63 +39,206 @@ interface TranscriptEntry {
   id?: string;
 }
 
+type LlmProvider = "gemini" | "openai" | "openrouter";
+
 interface PluginConfig {
   enabled?: boolean;
+  // Provider selection
+  provider?: LlmProvider;
+  // Gemini config
   geminiModel?: string;
   geminiApiKey?: string;
+  // OpenAI config
+  openaiModel?: string;
+  openaiApiKey?: string;
+  openaiBaseUrl?: string;
+  // OpenRouter config
+  openrouterModel?: string;
+  openrouterApiKey?: string;
+  // Shared
   maxTranscriptChars?: number;
 }
 
-interface GeminiResponse {
-  candidates?: Array<{
-    content?: {
-      parts?: Array<{ text?: string }>;
+interface LlmConfig {
+  provider: LlmProvider;
+  model: string;
+  apiKey: string;
+  baseUrl?: string;
+}
+
+// ─── LLM Abstraction ─────────────────────────────────────────────────────────
+
+function resolveKeyFromKeychain(service: string, account: string): string | null {
+  try {
+    return execSync(
+      `security find-generic-password -s "${service}" -a "${account}" -w 2>/dev/null`,
+      { encoding: "utf-8" },
+    ).trim() || null;
+  } catch {
+    return null;
+  }
+}
+
+function resolveLlmConfig(pluginConfig: PluginConfig): LlmConfig | null {
+  const provider = pluginConfig.provider || "gemini";
+
+  if (provider === "openai") {
+    const apiKey =
+      pluginConfig.openaiApiKey ||
+      process.env.OPENAI_API_KEY ||
+      resolveKeyFromKeychain("openai", "api-key");
+    if (!apiKey) return null;
+    return {
+      provider: "openai",
+      model: pluginConfig.openaiModel || "gpt-4o",
+      apiKey,
+      baseUrl: pluginConfig.openaiBaseUrl || "https://api.openai.com/v1",
     };
-  }>;
-  error?: { message?: string };
+  }
+
+  if (provider === "openrouter") {
+    const apiKey =
+      pluginConfig.openrouterApiKey ||
+      process.env.OPENROUTER_API_KEY ||
+      resolveKeyFromKeychain("openrouter", "api-key");
+    if (!apiKey) return null;
+    return {
+      provider: "openrouter",
+      model: pluginConfig.openrouterModel || "anthropic/claude-sonnet-4",
+      apiKey,
+      baseUrl: "https://openrouter.ai/api/v1",
+    };
+  }
+
+  // Default: Gemini
+  const apiKey =
+    pluginConfig.geminiApiKey ||
+    process.env.GEMINI_API_KEY ||
+    resolveKeyFromKeychain("gemini", "api-key");
+  if (!apiKey) return null;
+  return {
+    provider: "gemini",
+    model: pluginConfig.geminiModel || "gemini-3-pro-preview",
+    apiKey,
+  };
+}
+
+async function callLlm(
+  config: LlmConfig,
+  prompt: string,
+  systemInstruction?: string,
+  maxTokens: number = 8192,
+): Promise<string> {
+  if (config.provider === "gemini") {
+    return callGemini(config.apiKey, config.model, prompt, systemInstruction, maxTokens);
+  }
+  // OpenAI and OpenRouter both use the OpenAI chat completions format
+  return callOpenAICompat(config, prompt, systemInstruction, maxTokens);
+}
+
+async function callGemini(
+  apiKey: string,
+  model: string,
+  prompt: string,
+  systemInstruction?: string,
+  maxTokens: number = 8192,
+): Promise<string> {
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+
+  const body: any = {
+    contents: [{ parts: [{ text: prompt }] }],
+    generationConfig: {
+      temperature: 0.3,
+      maxOutputTokens: maxTokens,
+    },
+  };
+
+  if (systemInstruction) {
+    body.systemInstruction = { parts: [{ text: systemInstruction }] };
+  }
+
+  const response = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+
+  const data = await response.json() as any;
+
+  if (data.error) {
+    throw new Error(`Gemini API error: ${data.error.message}`);
+  }
+
+  const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
+  if (!text) {
+    throw new Error("Gemini returned empty response");
+  }
+
+  return text;
+}
+
+async function callOpenAICompat(
+  config: LlmConfig,
+  prompt: string,
+  systemInstruction?: string,
+  maxTokens: number = 8192,
+): Promise<string> {
+  const baseUrl = config.baseUrl || "https://api.openai.com/v1";
+  const url = `${baseUrl}/chat/completions`;
+
+  const messages: Array<{ role: string; content: string }> = [];
+  if (systemInstruction) {
+    messages.push({ role: "system", content: systemInstruction });
+  }
+  messages.push({ role: "user", content: prompt });
+
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    Authorization: `Bearer ${config.apiKey}`,
+  };
+
+  // OpenRouter-specific headers
+  if (config.provider === "openrouter") {
+    headers["HTTP-Referer"] = "https://github.com/clockworksquirrel/session-bridge-openclaw";
+    headers["X-Title"] = "Session Bridge for OpenClaw";
+  }
+
+  const body: any = {
+    model: config.model,
+    messages,
+    temperature: 0.3,
+    max_tokens: maxTokens,
+  };
+
+  const response = await fetch(url, {
+    method: "POST",
+    headers,
+    body: JSON.stringify(body),
+  });
+
+  const data = await response.json() as any;
+
+  if (data.error) {
+    const errMsg = typeof data.error === "string" ? data.error : data.error.message || JSON.stringify(data.error);
+    throw new Error(`${config.provider} API error: ${errMsg}`);
+  }
+
+  const text = data.choices?.[0]?.message?.content;
+  if (!text) {
+    throw new Error(`${config.provider} returned empty response`);
+  }
+
+  return text;
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-function resolveGeminiApiKey(pluginConfig: PluginConfig): string | null {
-  // 1. Plugin config
-  if (pluginConfig.geminiApiKey) return pluginConfig.geminiApiKey;
-
-  // 2. Environment variable
-  if (process.env.GEMINI_API_KEY) return process.env.GEMINI_API_KEY;
-
-  // 3. macOS Keychain
-  try {
-    const key = execSync(
-      'security find-generic-password -s "gemini" -a "api-key" -w 2>/dev/null',
-      { encoding: "utf-8" },
-    ).trim();
-    if (key) return key;
-  } catch {
-    // Keychain not available or entry not found
-  }
-
-  return null;
-}
-
 function findSessionsDir(config: any): string {
-  // Default path: ~/.openclaw/agents/<agentId>/sessions/
   const stateDir =
     config.stateDir ||
     join(process.env.HOME || "/tmp", ".openclaw");
   const agentId = config.agents?.list?.[0]?.id || "main";
-  const result = join(stateDir, "agents", agentId, "sessions");
-
-  // Debug: also check what files are actually there
-  try {
-    const { readdirSync } = require("fs");
-    const files = readdirSync(result);
-    console.error(`[session-bridge] findSessionsDir: ${result} has ${files.length} files: ${files.slice(0, 10).join(", ")}`);
-  } catch (e) {
-    console.error(`[session-bridge] findSessionsDir: ${result} - error reading: ${e}`);
-  }
-
-  return result;
+  return join(stateDir, "agents", agentId, "sessions");
 }
 
 function readSessionStore(sessionsDir: string): SessionStore {
@@ -114,32 +257,25 @@ function writeSessionStore(sessionsDir: string, store: SessionStore): void {
 }
 
 function readTranscript(sessionsDir: string, sessionId: string, maxChars: number): string {
-  // Try direct sessionId.jsonl
-  let transcriptPath = join(sessionsDir, `${sessionId}.jsonl`);
+  const transcriptPath = join(sessionsDir, `${sessionId}.jsonl`);
   if (!existsSync(transcriptPath)) {
-    // Sometimes sessionId has colons that become part of the filename
-    // Try finding it
     return `[Transcript file not found: ${transcriptPath}]`;
   }
 
   const raw = readFileSync(transcriptPath, "utf-8");
   const lines = raw.split("\n").filter((l) => l.trim());
 
-  // Extract readable conversation from JSONL
   const messages: string[] = [];
   let totalChars = 0;
 
   for (const line of lines) {
     try {
       const entry: TranscriptEntry = JSON.parse(line);
-
-      // Skip non-message entries
       if (entry.type === "session") continue;
 
       let role = "";
       let text = "";
 
-      // Handle different entry formats
       if (entry.message) {
         role = entry.message.role || "unknown";
         if (typeof entry.message.content === "string") {
@@ -163,12 +299,9 @@ function readTranscript(sessionsDir: string, sessionId: string, maxChars: number
       }
 
       if (!text || !role) continue;
-
-      // Skip tool results and system events that are just noise
       if (role === "tool") continue;
 
       const formatted = `[${role.toUpperCase()}]: ${text}`;
-
       if (totalChars + formatted.length > maxChars) break;
 
       messages.push(formatted);
@@ -181,52 +314,74 @@ function readTranscript(sessionsDir: string, sessionId: string, maxChars: number
   return messages.join("\n\n---\n\n");
 }
 
-async function callGemini(
-  apiKey: string,
-  model: string,
-  prompt: string,
-  systemInstruction?: string,
-): Promise<string> {
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+// ─── Batched Session Naming ──────────────────────────────────────────────────
 
-  const body: any = {
-    contents: [{ parts: [{ text: prompt }] }],
-    generationConfig: {
-      temperature: 0.3,
-      maxOutputTokens: 8192,
-    },
-  };
+async function batchGenerateSessionNames(
+  llmConfig: LlmConfig,
+  sessions: Array<{ key: string; snippet: string }>,
+): Promise<Map<string, string>> {
+  const results = new Map<string, string>();
+  if (sessions.length === 0) return results;
 
-  if (systemInstruction) {
-    body.systemInstruction = { parts: [{ text: systemInstruction }] };
+  // Build a single prompt with all sessions
+  const sessionBlocks = sessions.map((s, i) =>
+    `SESSION_${i + 1} (key: ${s.key}):\n${s.snippet}`
+  ).join("\n\n---\n\n");
+
+  const systemInstruction = `You are a conversation title generator. You will receive multiple conversation snippets, each labeled SESSION_1, SESSION_2, etc. For each one, generate a short, descriptive title.
+
+Rules:
+- 3-6 words per title
+- No quotes around titles
+- No punctuation at the end
+- Be specific (not "Coding Discussion" but "Electron Window Manager Build")
+- Output format: one line per session, exactly like:
+SESSION_1: Your Title Here
+SESSION_2: Another Title Here
+- Output ONLY the titled lines, nothing else — no explanation, no preamble, no blank lines`;
+
+  const prompt = `Generate titles for these ${sessions.length} conversations:\n\n${sessionBlocks}`;
+
+  try {
+    const response = await callLlm(llmConfig, prompt, systemInstruction, 2048);
+
+    // Parse response lines
+    for (const line of response.split("\n")) {
+      const match = line.match(/^SESSION_(\d+):\s*(.+)$/i);
+      if (match) {
+        const idx = parseInt(match[1], 10) - 1;
+        if (idx >= 0 && idx < sessions.length) {
+          const name = match[2]
+            .replace(/^["'*]|["'*]$/g, "")
+            .replace(/\.$/, "")
+            .trim()
+            .slice(0, 60);
+          if (name) {
+            results.set(sessions[idx].key, name);
+          }
+        }
+      }
+    }
+  } catch (err) {
+    // If batch fails, try individual naming as fallback (up to 3)
+    const fallbackCount = Math.min(sessions.length, 3);
+    for (let i = 0; i < fallbackCount; i++) {
+      try {
+        const name = await generateSingleSessionName(llmConfig, sessions[i].snippet);
+        if (name) results.set(sessions[i].key, name);
+      } catch {
+        // Skip this one
+      }
+    }
   }
 
-  const response = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
-
-  const data: GeminiResponse = await response.json();
-
-  if (data.error) {
-    throw new Error(`Gemini API error: ${data.error.message}`);
-  }
-
-  const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
-  if (!text) {
-    throw new Error("Gemini returned empty response");
-  }
-
-  return text;
+  return results;
 }
 
-async function generateSessionName(
-  apiKey: string,
-  model: string,
+async function generateSingleSessionName(
+  llmConfig: LlmConfig,
   transcript: string,
 ): Promise<string> {
-  // Only send first ~3000 chars for naming — enough to understand the topic
   const snippet = transcript.slice(0, 3000);
 
   const systemInstruction = `You are a conversation title generator. Your ONLY job is to output a short, descriptive title for a conversation. Rules:
@@ -237,12 +392,7 @@ async function generateSessionName(
 - Be specific (not "Coding Discussion" but "Electron Window Manager Build")
 - Output ONLY the title, nothing else — no explanation, no preamble`;
 
-  const prompt = `Generate a title for this conversation:
-
-${snippet}`;
-
-  const name = await callGemini(apiKey, model, prompt, systemInstruction);
-  // Clean up — remove quotes, trim, take first line only
+  const name = await callLlm(llmConfig, `Generate a title for this conversation:\n\n${snippet}`, systemInstruction, 100);
   return name
     .replace(/^["'*]|["'*]$/g, "")
     .replace(/\.$/, "")
@@ -252,8 +402,7 @@ ${snippet}`;
 }
 
 async function generateSessionSummary(
-  apiKey: string,
-  model: string,
+  llmConfig: LlmConfig,
   transcript: string,
   sessionName: string,
 ): Promise<string> {
@@ -293,7 +442,7 @@ ${transcript}
 
 Generate the JSON summary:`;
 
-  return await callGemini(apiKey, model, prompt, systemInstruction);
+  return await callLlm(llmConfig, prompt, systemInstruction);
 }
 
 function formatTimeAgo(dateVal: string | number | undefined): string {
@@ -325,7 +474,6 @@ function resolveSessionKey(
 ): { key: string; entry: SessionEntry } | null {
   const trimmed = input.trim();
 
-  // Try by number (from list)
   const num = parseInt(trimmed, 10);
   if (!isNaN(num) && num > 0) {
     const entries = Object.entries(store)
@@ -342,12 +490,10 @@ function resolveSessionKey(
     return null;
   }
 
-  // Try by exact key
   if (store[trimmed]) {
     return { key: trimmed, entry: store[trimmed] };
   }
 
-  // Try by display name (case-insensitive, fuzzy)
   const lower = trimmed.toLowerCase();
   for (const [key, entry] of Object.entries(store)) {
     const name = (entry.displayName || "").toLowerCase();
@@ -356,7 +502,6 @@ function resolveSessionKey(
     }
   }
 
-  // Try by key substring
   for (const [key, entry] of Object.entries(store)) {
     if (key.toLowerCase().includes(lower)) {
       return { key, entry };
@@ -366,12 +511,26 @@ function resolveSessionKey(
   return null;
 }
 
+function getSessionType(key: string): string {
+  if (key.includes(":cron:") && key.includes(":run:")) return "⏰ cron-run";
+  if (key.includes(":cron:")) return "⏰ cron";
+  if (key.startsWith("hook:")) return "🪝 hook";
+  if (key.includes(":subagent:")) return "🤖 subagent";
+  if (key.includes(":group:")) return "👥 group";
+  if (key.includes(":channel:")) return "📢 channel";
+  if (key.includes(":thread:")) return "🧵 thread";
+  if (key.includes(":topic:")) return "🧵 topic";
+  if (key.includes(":dm:")) return "💬 dm";
+  if (key.includes(":slash:")) return "⚡ slash";
+  return "💬 session";
+}
+
 // ─── Plugin ───────────────────────────────────────────────────────────────────
 
 const sessionBridgePlugin = {
   id: "session-bridge",
   name: "Session Bridge",
-  description: "Cross-channel session context bridging with Gemini summarization",
+  description: "Cross-channel session context bridging with LLM summarization (Gemini, OpenAI, OpenRouter)",
   configSchema: {
     parse(value: unknown) {
       if (!value || typeof value !== "object") return {};
@@ -385,7 +544,6 @@ const sessionBridgePlugin = {
         ? (api.pluginConfig as PluginConfig)
         : {};
 
-    const geminiModel = pluginConfig.geminiModel || "gemini-3-pro-preview";
     const maxTranscriptChars = pluginConfig.maxTranscriptChars || 200000;
 
     api.registerCommand({
@@ -394,428 +552,374 @@ const sessionBridgePlugin = {
       acceptsArgs: true,
       requireAuth: true,
       handler: async (ctx) => {
-        api.logger.info(`[session-bridge] Command handler invoked. channel=${ctx.channel} sender=${ctx.senderId} args="${ctx.args || ""}"`);
+        api.logger.info(`[session-bridge] Command invoked. channel=${ctx.channel} args="${ctx.args || ""}"`);
 
         try {
           const args = (ctx.args || "").trim();
           const tokens = args.split(/\s+/);
           const action = tokens[0]?.toLowerCase() || "list";
 
-          api.logger.info(`[session-bridge] Parsed action: "${action}" from args: "${args}"`);
-
           const sessionsDir = findSessionsDir(ctx.config);
-          api.logger.info(`[session-bridge] Resolved sessionsDir: ${sessionsDir}`);
-
           const store = readSessionStore(sessionsDir);
-          api.logger.info(`[session-bridge] Loaded store with ${Object.keys(store).length} entries`);
 
-        // ── /session list [--all] ──────────────────────────────────────
-        if (action === "list" || action === "ls") {
-          const showAll = tokens.includes("--all") || tokens.includes("-a");
-          api.logger.info(`[session-bridge] /session list invoked`);
-          api.logger.info(`[session-bridge] sessionsDir: ${sessionsDir}`);
-          api.logger.info(`[session-bridge] sessionsDir exists: ${existsSync(sessionsDir)}`);
+          // ── /session list [--all] ──────────────────────────────────
+          if (action === "list" || action === "ls") {
+            const showAll = tokens.includes("--all") || tokens.includes("-a");
 
-          const storeKeys = Object.keys(store);
-          api.logger.info(`[session-bridge] store has ${storeKeys.length} keys: ${storeKeys.join(", ")}`);
+            const llmConfig = resolveLlmConfig(pluginConfig);
 
-          const apiKey = resolveGeminiApiKey(pluginConfig);
-          api.logger.info(`[session-bridge] Gemini API key resolved: ${apiKey ? "yes (" + apiKey.slice(0, 8) + "...)" : "NO"}`);
-
-          const entries = Object.entries(store)
-            .filter(([_, e]) => e.sessionId)
-            .sort((a, b) => {
-              const ta = typeof a[1].updatedAt === "number" ? a[1].updatedAt : new Date(a[1].updatedAt || 0).getTime();
-              const tb = typeof b[1].updatedAt === "number" ? b[1].updatedAt : new Date(b[1].updatedAt || 0).getTime();
-              return tb - ta;
-            });
-
-          api.logger.info(`[session-bridge] total entries with sessionId: ${entries.length}`);
-
-          if (entries.length === 0) {
-            // Show debug info in the response too
-            return {
-              text: `📋 No active sessions found.\n\n🔍 Debug:\n- Sessions dir: ${sessionsDir}\n- Dir exists: ${existsSync(sessionsDir)}\n- Store keys: ${storeKeys.length > 0 ? storeKeys.join(", ") : "(empty)"}\n- Store entries with sessionId: 0`,
-            };
-          }
-
-          // Auto-name sessions that don't have displayName
-          let needsWrite = false;
-          for (const [key, entry] of entries) {
-            if (!entry.displayName && entry.sessionId && apiKey) {
-              api.logger.info(`[session-bridge] Auto-naming session: ${key} (sessionId: ${entry.sessionId})`);
-              try {
-                const transcript = readTranscript(sessionsDir, entry.sessionId, 2000);
-                api.logger.info(`[session-bridge] Transcript for ${key}: ${transcript ? transcript.length + " chars" : "null"}, starts with: ${transcript?.slice(0, 50)}`);
-                if (transcript && !transcript.startsWith("[Transcript")) {
-                  const name = await generateSessionName(apiKey, geminiModel, transcript);
-                  api.logger.info(`[session-bridge] Generated name for ${key}: "${name}"`);
-                  entry.displayName = name;
-                  store[key] = entry;
-                  needsWrite = true;
-                }
-              } catch (err) {
-                api.logger.error(`[session-bridge] Failed to auto-name session ${key}: ${err}`);
-              }
-            }
-          }
-
-          if (needsWrite) {
-            try {
-              writeSessionStore(sessionsDir, store);
-              api.logger.info(`[session-bridge] Wrote updated session store`);
-            } catch (err) {
-              api.logger.error(`[session-bridge] Failed to write session store: ${err}`);
-            }
-          }
-
-          // Determine session type from key
-          function getSessionType(key: string): string {
-            if (key.includes(":cron:") && key.includes(":run:")) return "⏰ cron-run";
-            if (key.includes(":cron:")) return "⏰ cron";
-            if (key.startsWith("hook:")) return "🪝 hook";
-            if (key.includes(":subagent:")) return "🤖 subagent";
-            if (key.includes(":group:")) return "👥 group";
-            if (key.includes(":channel:")) return "📢 channel";
-            if (key.includes(":thread:")) return "🧵 thread";
-            if (key.includes(":topic:")) return "🧵 topic";
-            if (key.includes(":dm:")) return "💬 dm";
-            if (key.includes(":slash:")) return "⚡ slash";
-            return "💬 session";
-          }
-
-          // Collapse duplicate cron runs — show parent cron once with run count
-          const cronParents = new Map<string, number>();
-          const displayEntries: Array<[string, SessionEntry, string]> = [];
-
-          for (const [key, entry] of entries) {
-            const sessionType = getSessionType(key);
-
-            if (key.includes(":cron:") && key.includes(":run:")) {
-              // Extract parent cron key
-              const parentKey = key.replace(/:run:[^:]+$/, "");
-              cronParents.set(parentKey, (cronParents.get(parentKey) || 0) + 1);
-              // Skip individual runs — we'll show the parent with a count
-              continue;
-            }
-
-            if (key.includes(":cron:") && !key.includes(":run:")) {
-              // This is the parent cron — we'll add run count later
-              displayEntries.push([key, entry, sessionType]);
-              continue;
-            }
-
-            displayEntries.push([key, entry, sessionType]);
-          }
-
-          const lines = displayEntries.map(([key, entry, sessionType], i) => {
-            const name = entry.displayName || key;
-            const channel = entry.origin?.provider || entry.channel || entry.provider || "";
-            const time = formatTimeAgo(entry.updatedAt);
-            const runCount = cronParents.get(key);
-            const runSuffix = runCount ? ` (${runCount} runs)` : "";
-            const channelStr = channel ? `, ${channel}` : "";
-            return `${i + 1}. ${sessionType} "${name}"${channelStr}, ${time}${runSuffix}`;
-          });
-
-          if (lines.length === 0 && !showAll) {
-            return { text: "📋 No active sessions found.\nTry /session list --all to include historical sessions." };
-          }
-
-          // If --all, also scan for orphaned transcript files not in the store
-          let orphanSection = "";
-          if (showAll) {
-            try {
-              const { readdirSync, statSync } = require("fs");
-              const allFiles: string[] = readdirSync(sessionsDir)
-                .filter((f: string) => f.endsWith(".jsonl"));
-              const knownSessionIds = new Set(
-                Object.values(store)
-                  .map((e: SessionEntry) => e.sessionId)
-                  .filter(Boolean),
-              );
-              const orphanFiles = allFiles.filter((f: string) => {
-                const id = f.replace(".jsonl", "");
-                return !knownSessionIds.has(id);
+            const entries = Object.entries(store)
+              .filter(([_, e]) => e.sessionId)
+              .sort((a, b) => {
+                const ta = typeof a[1].updatedAt === "number" ? a[1].updatedAt : new Date(a[1].updatedAt || 0).getTime();
+                const tb = typeof b[1].updatedAt === "number" ? b[1].updatedAt : new Date(b[1].updatedAt || 0).getTime();
+                return tb - ta;
               });
 
-              if (orphanFiles.length > 0) {
-                // Try to name orphaned sessions via Gemini
-                const orphanLines: string[] = [];
-                for (const file of orphanFiles.slice(0, 20)) { // Cap at 20 to avoid huge Gemini bills
-                  const sessionId = file.replace(".jsonl", "");
-                  const filePath = join(sessionsDir, file);
-                  const stat = statSync(filePath);
-                  const time = formatTimeAgo(stat.mtimeMs);
-
-                  let name = sessionId;
-                  if (apiKey) {
-                    try {
-                      const transcript = readTranscript(sessionsDir, sessionId, 2000);
-                      if (transcript && !transcript.startsWith("[Transcript")) {
-                        name = await generateSessionName(apiKey, geminiModel, transcript);
-                      }
-                    } catch {
-                      // Keep UUID as name
-                    }
-                  }
-
-                  orphanLines.push(`  📜 "${name}" — archived, ${time}`);
-                }
-                const moreCount = orphanFiles.length > 20 ? `\n  ... and ${orphanFiles.length - 20} more` : "";
-                orphanSection = `\n\n📜 Historical Sessions (${orphanFiles.length}):\n${orphanLines.join("\n")}${moreCount}`;
-              }
-            } catch (err) {
-              api.logger.error(`[session-bridge] Failed to scan orphaned transcripts: ${err}`);
+            if (entries.length === 0) {
+              return { text: `📋 No active sessions found.` };
             }
-          }
 
-          const allSuffix = !showAll && lines.length > 0
-            ? "\n\nTip: /session list --all to include historical sessions"
-            : "";
+            // ── Batch auto-name unnamed sessions ──────────────────────
+            const unnamed: Array<{ key: string; snippet: string }> = [];
+            for (const [key, entry] of entries) {
+              if (!entry.displayName && entry.sessionId && llmConfig) {
+                try {
+                  const transcript = readTranscript(sessionsDir, entry.sessionId, 2000);
+                  if (transcript && !transcript.startsWith("[Transcript")) {
+                    // Take first 800 chars per session for batch naming (keeps total prompt manageable)
+                    unnamed.push({ key, snippet: transcript.slice(0, 800) });
+                  }
+                } catch {
+                  // Skip
+                }
+              }
+            }
 
-          return { text: `📋 Active Sessions:\n${lines.join("\n")}${orphanSection}${allSuffix}` };
-        }
+            if (unnamed.length > 0 && llmConfig) {
+              api.logger.info(`[session-bridge] Batch naming ${unnamed.length} unnamed sessions via ${llmConfig.provider}/${llmConfig.model}`);
+              try {
+                const names = await batchGenerateSessionNames(llmConfig, unnamed);
+                let needsWrite = false;
+                for (const [key, name] of names) {
+                  if (store[key]) {
+                    store[key].displayName = name;
+                    needsWrite = true;
+                    api.logger.info(`[session-bridge] Named "${key}" → "${name}"`);
+                  }
+                }
+                if (needsWrite) {
+                  writeSessionStore(sessionsDir, store);
+                }
+              } catch (err) {
+                api.logger.error(`[session-bridge] Batch naming failed: ${err}`);
+              }
+            }
 
-        // ── /session name <title> ──────────────────────────────────────
-        if (action === "name" || action === "title") {
-          const newName = tokens.slice(1).join(" ").trim();
-          if (!newName) {
-            return { text: "❌ Usage: /session name <title>" };
-          }
+            // ── Collapse cron runs ──────────────────────────────────
+            const cronParents = new Map<string, number>();
+            const displayEntries: Array<[string, SessionEntry, string]> = [];
 
-          // Find the current session key from context
-          // The command handler doesn't directly expose the session key,
-          // so we try to find the most recently updated session for this channel
-          const currentChannel = ctx.channel || "webchat";
-          let currentKey: string | null = null;
+            for (const [key, entry] of entries) {
+              const sessionType = getSessionType(key);
 
-          // Find most recently updated session
-          const sorted = Object.entries(store)
-            .filter(([_, e]) => e.sessionId)
-            .sort((a, b) => {
-              const ta = a[1].updatedAt ? new Date(a[1].updatedAt).getTime() : 0;
-              const tb = b[1].updatedAt ? new Date(b[1].updatedAt).getTime() : 0;
-              return tb - ta;
+              if (key.includes(":cron:") && key.includes(":run:")) {
+                const parentKey = key.replace(/:run:[^:]+$/, "");
+                cronParents.set(parentKey, (cronParents.get(parentKey) || 0) + 1);
+                continue;
+              }
+
+              displayEntries.push([key, entry, sessionType]);
+            }
+
+            const lines = displayEntries.map(([key, entry, sessionType], i) => {
+              const name = entry.displayName || key;
+              const channel = entry.origin?.provider || entry.channel || entry.provider || "";
+              const time = formatTimeAgo(entry.updatedAt);
+              const runCount = cronParents.get(key);
+              const runSuffix = runCount ? ` (${runCount} runs)` : "";
+              const channelStr = channel ? `, ${channel}` : "";
+              return `${i + 1}. ${sessionType} "${name}"${channelStr}, ${time}${runSuffix}`;
             });
 
-          if (sorted.length > 0) {
-            // Prefer sessions from the same channel, otherwise take most recent
-            const sameChannel = sorted.find(
-              ([_, e]) =>
-                (e.origin?.provider || e.channel || "").includes(currentChannel),
-            );
-            currentKey = sameChannel ? sameChannel[0] : sorted[0][0];
-          }
+            // ── --all: scan orphaned transcripts ──────────────────────
+            let orphanSection = "";
+            if (showAll) {
+              try {
+                const { readdirSync, statSync } = require("fs");
+                const allFiles: string[] = readdirSync(sessionsDir)
+                  .filter((f: string) => f.endsWith(".jsonl"));
+                const knownSessionIds = new Set(
+                  Object.values(store)
+                    .map((e: SessionEntry) => e.sessionId)
+                    .filter(Boolean),
+                );
+                const orphanFiles = allFiles.filter((f: string) => {
+                  const id = f.replace(".jsonl", "");
+                  return !knownSessionIds.has(id);
+                });
 
-          if (!currentKey || !store[currentKey]) {
-            return { text: "❌ Could not identify current session." };
-          }
+                if (orphanFiles.length > 0) {
+                  // Batch name orphans too
+                  const orphanData: Array<{ key: string; snippet: string; time: string }> = [];
+                  for (const file of orphanFiles.slice(0, 20)) {
+                    const sessionId = file.replace(".jsonl", "");
+                    const filePath = join(sessionsDir, file);
+                    const stat = statSync(filePath);
+                    const time = formatTimeAgo(stat.mtimeMs);
+                    let snippet = "";
+                    try {
+                      const transcript = readTranscript(sessionsDir, sessionId, 800);
+                      if (transcript && !transcript.startsWith("[Transcript")) {
+                        snippet = transcript;
+                      }
+                    } catch { /* skip */ }
+                    orphanData.push({ key: sessionId, snippet, time });
+                  }
 
-          store[currentKey].displayName = newName;
-          try {
-            writeSessionStore(sessionsDir, store);
-          } catch (err) {
-            return { text: `❌ Failed to save name: ${err}` };
-          }
+                  // Batch name the ones with snippets
+                  const toName = orphanData.filter(o => o.snippet);
+                  let orphanNames = new Map<string, string>();
+                  if (toName.length > 0 && llmConfig) {
+                    try {
+                      orphanNames = await batchGenerateSessionNames(llmConfig, toName);
+                    } catch { /* skip */ }
+                  }
 
-          return { text: `✅ Session renamed to "${newName}"` };
-        }
+                  const orphanLines = orphanData.map(o => {
+                    const name = orphanNames.get(o.key) || o.key;
+                    return `  📜 "${name}" — archived, ${o.time}`;
+                  });
 
-        // ── /session rename <id> <title> ───────────────────────────────
-        if (action === "rename" || action === "mv") {
-          if (tokens.length < 3) {
-            return { text: "❌ Usage: /session rename <number or name> <new title>" };
-          }
-
-          const target = tokens[1];
-          const newName = tokens.slice(2).join(" ").trim();
-          const resolved = resolveSessionKey(store, target);
-
-          if (!resolved) {
-            return { text: `❌ Session not found: "${target}"` };
-          }
-
-          resolved.entry.displayName = newName;
-          store[resolved.key] = resolved.entry;
-          try {
-            writeSessionStore(sessionsDir, store);
-          } catch (err) {
-            return { text: `❌ Failed to save name: ${err}` };
-          }
-
-          return { text: `✅ Session renamed to "${newName}"` };
-        }
-
-        // ── /session load <id or name> ─────────────────────────────────
-        if (action === "load" || action === "bridge" || action === "switch") {
-          const target = tokens.slice(1).join(" ").trim();
-          if (!target) {
-            return { text: "❌ Usage: /session load <number or name>" };
-          }
-
-          const apiKey = resolveGeminiApiKey(pluginConfig);
-          if (!apiKey) {
-            return {
-              text: "❌ Gemini API key not configured. Set it in plugin config, GEMINI_API_KEY env var, or macOS Keychain (service: gemini, account: api-key).",
-            };
-          }
-
-          const resolved = resolveSessionKey(store, target);
-          if (!resolved) {
-            return { text: `❌ Session not found: "${target}"` };
-          }
-
-          if (!resolved.entry.sessionId) {
-            return { text: `❌ Session "${target}" has no transcript.` };
-          }
-
-          const sessionName =
-            resolved.entry.displayName || resolved.key;
-
-          // Read the transcript
-          const transcript = readTranscript(
-            sessionsDir,
-            resolved.entry.sessionId,
-            maxTranscriptChars,
-          );
-
-          if (transcript.startsWith("[Transcript")) {
-            return { text: `❌ ${transcript}` };
-          }
-
-          // Generate name if missing
-          if (!resolved.entry.displayName) {
-            try {
-              const name = await generateSessionName(apiKey, geminiModel, transcript);
-              resolved.entry.displayName = name;
-              store[resolved.key] = resolved.entry;
-              writeSessionStore(sessionsDir, store);
-            } catch {
-              // Non-critical, continue
+                  const moreCount = orphanFiles.length > 20 ? `\n  ... and ${orphanFiles.length - 20} more` : "";
+                  orphanSection = `\n\n📜 Historical Sessions (${orphanFiles.length}):\n${orphanLines.join("\n")}${moreCount}`;
+                }
+              } catch (err) {
+                api.logger.error(`[session-bridge] Failed to scan orphaned transcripts: ${err}`);
+              }
             }
+
+            const providerNote = llmConfig ? ` (via ${llmConfig.provider}/${llmConfig.model})` : "";
+            const allSuffix = !showAll && lines.length > 0
+              ? "\n\nTip: /session list --all to include historical sessions"
+              : "";
+
+            return { text: `📋 Active Sessions${providerNote}:\n${lines.join("\n")}${orphanSection}${allSuffix}` };
           }
 
-          const finalName = resolved.entry.displayName || sessionName;
+          // ── /session name <title> ──────────────────────────────────
+          if (action === "name" || action === "title") {
+            const newName = tokens.slice(1).join(" ").trim();
+            if (!newName) {
+              return { text: "❌ Usage: /session name <title>" };
+            }
 
-          // Generate summary via Gemini
-          let summary: string;
-          try {
-            summary = await generateSessionSummary(
-              apiKey,
-              geminiModel,
-              transcript,
-              finalName,
-            );
-          } catch (err) {
-            return {
-              text: `❌ Gemini summarization failed: ${err instanceof Error ? err.message : String(err)}`,
-            };
-          }
-
-          // Inject the summary into the current session via system event
-          // Build the injection message
-          const injectionMessage = `[Session Bridge] Loading context from session "${finalName}" (key: ${resolved.key})
-
-The following is an extensive JSONL-formatted summary generated by Gemini of the conversation from that session. Use this context to seamlessly continue the work discussed there.
-
-${summary}
-
----
-Session bridge complete. You now have full context from "${finalName}". Continue the conversation naturally.`;
-
-          // Enqueue as system event so the agent sees it on the next turn
-          try {
-            // We need to figure out the current session key for injection.
-            // Since registerCommand doesn't expose it directly, we inject into
-            // the most likely current session for this channel.
             const currentChannel = ctx.channel || "webchat";
+            let currentKey: string | null = null;
 
-            // Find the session key for the current channel
-            let currentSessionKey: string | null = null;
-
-            // For the main session (most common), it's agent:main:main
-            // But we should try to find the actual current session
-            const recentSessions = Object.entries(store)
-              .filter(([k, _]) => k !== resolved.key) // Don't inject into the source session
+            const sorted = Object.entries(store)
+              .filter(([_, e]) => e.sessionId)
               .sort((a, b) => {
                 const ta = a[1].updatedAt ? new Date(a[1].updatedAt).getTime() : 0;
                 const tb = b[1].updatedAt ? new Date(b[1].updatedAt).getTime() : 0;
                 return tb - ta;
               });
 
-            // Try to find a session matching the current channel
-            const channelMatch = recentSessions.find(([_, e]) => {
-              const prov = e.origin?.provider || e.channel || "";
-              return prov.includes(currentChannel);
-            });
-
-            if (channelMatch) {
-              currentSessionKey = channelMatch[0];
-            } else if (recentSessions.length > 0) {
-              // Fall back to most recent session
-              currentSessionKey = recentSessions[0][0];
+            if (sorted.length > 0) {
+              const sameChannel = sorted.find(
+                ([_, e]) =>
+                  (e.origin?.provider || e.channel || "").includes(currentChannel),
+              );
+              currentKey = sameChannel ? sameChannel[0] : sorted[0][0];
             }
 
-            if (currentSessionKey) {
-              api.runtime.system.enqueueSystemEvent(injectionMessage, {
-                sessionKey: currentSessionKey,
-              });
+            if (!currentKey || !store[currentKey]) {
+              return { text: "❌ Could not identify current session." };
             }
-          } catch (err) {
-            api.logger.warn(`[session-bridge] Failed to enqueue system event: ${err}`);
-            // Even if system event injection fails, return the summary as the command reply
-            // so the user still sees it
+
+            store[currentKey].displayName = newName;
+            try {
+              writeSessionStore(sessionsDir, store);
+            } catch (err) {
+              return { text: `❌ Failed to save name: ${err}` };
+            }
+
+            return { text: `✅ Session renamed to "${newName}"` };
           }
 
-          // Also return the summary as the command reply (user sees it immediately)
-          return {
-            text: `✅ Session "${finalName}" loaded!\n\nContext has been injected into your current session. The assistant now has full context from that conversation.\n\n📝 Summary preview:\n${summary.slice(0, 500)}${summary.length > 500 ? "..." : ""}`,
-          };
-        }
+          // ── /session rename <id> <title> ───────────────────────────
+          if (action === "rename" || action === "mv") {
+            if (tokens.length < 3) {
+              return { text: "❌ Usage: /session rename <number or name> <new title>" };
+            }
 
-        // ── /session help ──────────────────────────────────────────────
-        if (action === "help" || action === "?") {
-          return {
-            text: `📋 Session Bridge Commands:
+            const target = tokens[1];
+            const newName = tokens.slice(2).join(" ").trim();
+            const resolved = resolveSessionKey(store, target);
+
+            if (!resolved) {
+              return { text: `❌ Session not found: "${target}"` };
+            }
+
+            resolved.entry.displayName = newName;
+            store[resolved.key] = resolved.entry;
+            try {
+              writeSessionStore(sessionsDir, store);
+            } catch (err) {
+              return { text: `❌ Failed to save name: ${err}` };
+            }
+
+            return { text: `✅ Session renamed to "${newName}"` };
+          }
+
+          // ── /session load <id or name> ─────────────────────────────
+          if (action === "load" || action === "bridge" || action === "switch") {
+            const target = tokens.slice(1).join(" ").trim();
+            if (!target) {
+              return { text: "❌ Usage: /session load <number or name>" };
+            }
+
+            const llmConfig = resolveLlmConfig(pluginConfig);
+            if (!llmConfig) {
+              return {
+                text: "❌ No LLM API key configured. Set provider config in plugin settings, environment variables, or macOS Keychain.\n\nSupported providers: gemini, openai, openrouter",
+              };
+            }
+
+            const resolved = resolveSessionKey(store, target);
+            if (!resolved) {
+              return { text: `❌ Session not found: "${target}"` };
+            }
+
+            if (!resolved.entry.sessionId) {
+              return { text: `❌ Session "${target}" has no transcript.` };
+            }
+
+            const sessionName = resolved.entry.displayName || resolved.key;
+
+            const transcript = readTranscript(
+              sessionsDir,
+              resolved.entry.sessionId,
+              maxTranscriptChars,
+            );
+
+            if (transcript.startsWith("[Transcript")) {
+              return { text: `❌ ${transcript}` };
+            }
+
+            // Generate name if missing
+            if (!resolved.entry.displayName) {
+              try {
+                const name = await generateSingleSessionName(llmConfig, transcript);
+                resolved.entry.displayName = name;
+                store[resolved.key] = resolved.entry;
+                writeSessionStore(sessionsDir, store);
+              } catch { /* non-critical */ }
+            }
+
+            const finalName = resolved.entry.displayName || sessionName;
+
+            // Generate summary
+            let summary: string;
+            try {
+              summary = await generateSessionSummary(llmConfig, transcript, finalName);
+            } catch (err) {
+              return {
+                text: `❌ Summarization failed (${llmConfig.provider}/${llmConfig.model}): ${err instanceof Error ? err.message : String(err)}`,
+              };
+            }
+
+            const injectionMessage = `[Session Bridge] Loading context from session "${finalName}" (key: ${resolved.key})
+
+The following is an extensive JSONL-formatted summary generated by ${llmConfig.provider}/${llmConfig.model} of the conversation from that session. Use this context to seamlessly continue the work discussed there.
+
+${summary}
+
+---
+Session bridge complete. You now have full context from "${finalName}". Continue the conversation naturally.`;
+
+            try {
+              const currentChannel = ctx.channel || "webchat";
+              let currentSessionKey: string | null = null;
+
+              const recentSessions = Object.entries(store)
+                .filter(([k, _]) => k !== resolved.key)
+                .sort((a, b) => {
+                  const ta = a[1].updatedAt ? new Date(a[1].updatedAt).getTime() : 0;
+                  const tb = b[1].updatedAt ? new Date(b[1].updatedAt).getTime() : 0;
+                  return tb - ta;
+                });
+
+              const channelMatch = recentSessions.find(([_, e]) => {
+                const prov = e.origin?.provider || e.channel || "";
+                return prov.includes(currentChannel);
+              });
+
+              if (channelMatch) {
+                currentSessionKey = channelMatch[0];
+              } else if (recentSessions.length > 0) {
+                currentSessionKey = recentSessions[0][0];
+              }
+
+              if (currentSessionKey) {
+                api.runtime.system.enqueueSystemEvent(injectionMessage, {
+                  sessionKey: currentSessionKey,
+                });
+              }
+            } catch (err) {
+              api.logger.warn(`[session-bridge] Failed to enqueue system event: ${err}`);
+            }
+
+            return {
+              text: `✅ Session "${finalName}" loaded via ${llmConfig.provider}!\n\nContext has been injected into your current session. The assistant now has full context from that conversation.\n\n📝 Summary preview:\n${summary.slice(0, 500)}${summary.length > 500 ? "..." : ""}`,
+            };
+          }
+
+          // ── /session help ──────────────────────────────────────────
+          if (action === "help" || action === "?") {
+            const llmConfig = resolveLlmConfig(pluginConfig);
+            const providerInfo = llmConfig
+              ? `\n\n🔌 Provider: ${llmConfig.provider} (${llmConfig.model})`
+              : "\n\n⚠️ No LLM provider configured";
+
+            return {
+              text: `📋 Session Bridge Commands:
 
 /session list — List active sessions with names and activity
 /session list --all — Include historical/archived sessions
 /session load <# or name> — Load session context into current chat
 /session name <title> — Name the current session
 /session rename <# or name> <title> — Rename any session
-/session help — Show this help`,
-          };
-        }
+/session help — Show this help${providerInfo}
 
-        // ── Default: treat as /session list ────────────────────────────
-        // If someone types /session with something we don't recognize,
-        // try to load it (maybe they typed /session 1 or /session "my project")
-        const resolved = resolveSessionKey(store, args);
-        if (resolved) {
-          // Redirect to load logic
-          const fakeCtx = { ...ctx, args: `load ${args}` };
-          // Re-run as load — but to avoid recursion, just tell them to use load
+Supported providers: gemini, openai, openrouter
+Configure in OpenClaw plugin settings.`,
+            };
+          }
+
+          // ── Default: suggest load ──────────────────────────────────
+          const resolved = resolveSessionKey(store, args);
+          if (resolved) {
+            return {
+              text: `Did you mean: /session load ${args}?\n\nUse /session help to see all commands.`,
+            };
+          }
+
           return {
-            text: `Did you mean: /session load ${args}?\n\nUse /session help to see all commands.`,
+            text: `❓ Unknown command: /session ${action}\n\nUse /session help to see available commands.`,
           };
-        }
-
-        return {
-          text: `❓ Unknown command: /session ${action}\n\nUse /session help to see available commands.`,
-        };
 
         } catch (err) {
           const errMsg = err instanceof Error ? err.stack || err.message : String(err);
-          api.logger.error(`[session-bridge] Unhandled error in command handler: ${errMsg}`);
-          return {
-            text: `❌ Session Bridge Error:\n${errMsg}`,
-          };
+          api.logger.error(`[session-bridge] Unhandled error: ${errMsg}`);
+          return { text: `❌ Session Bridge Error:\n${errMsg}` };
         }
       },
     });
 
-    api.logger.info("[session-bridge] Plugin registered. Use /session to manage sessions.");
+    const llmConfig = resolveLlmConfig(pluginConfig);
+    const providerStr = llmConfig ? `${llmConfig.provider}/${llmConfig.model}` : "no provider configured";
+    api.logger.info(`[session-bridge] Plugin registered. Provider: ${providerStr}. Use /session to manage sessions.`);
   },
 };
 
